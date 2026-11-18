@@ -262,7 +262,7 @@ for epoch in range(1, EPOCHS + 1):
             f"blank ratio={blank_frames / total_frames:.3f}",
             flush=True,
         )
-
+        evaluate_dev(epoch)
         for ref, hyp in zip(debug_refs[:2], debug_hyps[:2]):
             print("REF:", ref, flush=True)
             print("HYP:", repr(hyp), flush=True)
@@ -277,13 +277,3 @@ model.save_pretrained(model_dir, safe_serialization=True)
 processor.save_pretrained(model_dir)
 
 print("Final model saved to:", model_dir, flush=True)
-
-
-
-output_path = PROJECT / "dev_predictions_baseline.csv"
-with output_path.open("w", encoding="utf-8", newline="") as f:
-    writer = csv.writer(f)
-    writer.writerow(["reference", "prediction"])
-    writer.writerows(zip(references, predictions))
-
-print("\nPredictions saved to:", output_path, flush=True)
