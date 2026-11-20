@@ -20,8 +20,9 @@ python train_with_limited.py --resume outputs/limited_checkpoints/latest.pt --ep
 `--checkpoint-dir` and `--output-dir` override the checkpoint and final model
 locations. 
 
-example project constructure:
+### Example project structure
 
+```text
 speech_recognition/
 ├── train.py
 ├── train_with_limited.py
@@ -31,10 +32,11 @@ speech_recognition/
 │       ├── geo/
 │       │   ├── train.csv
 │       │   └── dev.csv
-│       └── ... audio files
+│       └── ...                  # Audio files
 ├── models/
 │   └── mhubert-147/
-│       └── ...download from mhubert
+│       └── ...                  # Downloaded mHuBERT model files
 └── artifacts/
     └── processor/
-        └── ...I use the CTC processor, u can replace by yours
+        └── ...                  # CTC processor files; replace with your own
+```
