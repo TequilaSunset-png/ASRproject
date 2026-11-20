@@ -7,10 +7,13 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 from transformers import HubertForCTC, Wav2Vec2Processor
 
-PROJECT = Path("/scratch/work/ouy1/speech_recognition")
+from training_checkpoint import parse_training_args, restore_checkpoint, save_checkpoint
+
+args = parse_training_args(Path("/scratch/work/ouy1/speech_recognition"), "baseline")
+PROJECT = args.project
 DATA_ROOT = PROJECT / "data/project"
 
-EPOCHS = 100
+EPOCHS = args.epochs
 BATCH_SIZE = 8
 LEARNING_RATE = 1e-5
 
@@ -34,18 +37,16 @@ model = HubertForCTC.from_pretrained(
 )
 
 model.freeze_feature_encoder()
+
 model.config.apply_spec_augment = False
 
 for module in model.modules():
     if isinstance(module, torch.nn.Dropout):
-        module.p = 0.0
+        module.p = 0.1
 
 model.config.layerdrop = 0.0
 
-
-
 model.to(device)
-
 
 class GeoDataset(Dataset):
     def __init__(self, split):
@@ -74,15 +75,10 @@ def collate_batch(examples):
         sampling_rate=16000,
         padding=True,
         return_tensors="pt",
-        return_attention_mask=False,
+        return_attention_mask=True,
     )
 
-    audio_lengths = torch.tensor(
-        [len(audio) for audio in audios],
-        dtype=torch.long,
-    )
-
-    return inputs.input_values, audio_lengths, list(texts)
+    return inputs.input_values, inputs.attention_mask, list(texts)
 
 
 small_train = torch.utils.data.Subset(
@@ -141,12 +137,15 @@ def evaluate_dev(epoch):
     predictions = []
 
     with torch.no_grad():
-        for inputs, audio_lengths, texts in dev_loader:
-            logits = model(input_values=inputs.to(device)).logits
+        for inputs, attention_mask, texts in dev_loader:
+            logits = model(
+                input_values=inputs.to(device),
+                attention_mask=attention_mask.to(device),
+            ).logits
             predicted_ids = logits.argmax(dim=-1).cpu()
 
             output_lengths = model._get_feat_extract_output_lengths(
-                audio_lengths
+                attention_mask.sum(dim=-1)
             )
 
             for ids, length in zip(predicted_ids, output_lengths):
@@ -166,15 +165,30 @@ def evaluate_dev(epoch):
     for reference, prediction in zip(references[:5], predictions[:5]):
         print("\nREF:", reference, flush=True)
         print("HYP:", repr(prediction), flush=True)
-    model.train()
+
     return references, predictions
 
 
-for epoch in range(1, EPOCHS + 1):
+# Checkpoints from the two freezing strategies are intentionally incompatible.
+checkpoint_metadata = {
+    "training_mode": "feature_encoder_frozen",
+    "batch_size": BATCH_SIZE,
+    "train_size": len(train_loader.dataset),
+    "learning_rate": LEARNING_RATE,
+    "warmup_steps": warmup_steps,
+    "vocab": processor.tokenizer.get_vocab(),
+}
+start_epoch, global_step = 1, 0
+if args.resume is not None:
+    start_epoch, global_step = restore_checkpoint(
+        args.resume, model, optimizer, scheduler, checkpoint_metadata,
+    )
+
+for epoch in range(start_epoch, EPOCHS + 1):
     model.train()
     total_loss = 0.0
 
-    for step, (inputs, audio_lengths, texts) in enumerate(
+    for step, (inputs, attention_mask, texts) in enumerate(
         train_loader, start=1
     ):
         inputs = inputs.to(device)
@@ -195,10 +209,13 @@ for epoch in range(1, EPOCHS + 1):
         )
 
         optimizer.zero_grad(set_to_none=True)
-        logits = model(input_values=inputs).logits
+        logits = model(
+            input_values=inputs,
+            attention_mask=attention_mask.to(device),
+        ).logits
 
         output_lengths = model._get_feat_extract_output_lengths(
-            audio_lengths
+            attention_mask.sum(dim=-1)
         ).to(dtype=torch.long)
 
         loss = ctc_loss(
@@ -215,22 +232,11 @@ for epoch in range(1, EPOCHS + 1):
         loss.backward()
         optimizer.step()
         scheduler.step()
+        global_step += 1
 
         total_loss += loss.item()
 
-        
-        '''
-        if step == 1 or step % 100 == 0:
-            print(
-                f"Epoch {epoch}/{EPOCHS} | "
-                f"Step {step}/{len(train_loader)} | "
-                f"Mean loss: {total_loss / step:.4f} | "
-                f"LR: {optimizer.param_groups[0]['lr']:.2e}",
-                flush=True,
-            )
-        '''
-
-    if epoch % 10 == 0:
+    if epoch % 2 == 0:
         model.eval()
         debug_refs = []
         debug_hyps = []
@@ -238,22 +244,28 @@ for epoch in range(1, EPOCHS + 1):
         total_frames = 0
 
         with torch.no_grad():
-            for inputs, audio_lengths, texts in train_loader:
+            for inputs, attention_mask, texts in train_loader:
                 logits = model(
-                    input_values=inputs.to(device)
+                    input_values=inputs.to(device),
+                    attention_mask=attention_mask.to(device),
                 ).logits
 
                 ids = logits.argmax(dim=-1).cpu()
 
-            
-                blank_frames += (
-                    ids == processor.tokenizer.pad_token_id
-                ).sum().item()
-                total_frames += ids.numel()
-
-                debug_hyps.extend(
-                    processor.batch_decode(ids)
+                output_lengths = model._get_feat_extract_output_lengths(
+                    attention_mask.sum(dim=-1)
                 )
+                for sequence, length in zip(ids, output_lengths):
+                    valid_ids = sequence[:int(length)]
+                    blank_frames += (
+                        valid_ids == processor.tokenizer.pad_token_id
+                    ).sum().item()
+                    total_frames += valid_ids.numel()
+                    debug_hyps.append(processor.tokenizer.decode(
+                        valid_ids.tolist(),
+                        group_tokens=True,
+                        clean_up_tokenization_spaces=False,
+                    ))
                 debug_refs.extend(texts)
 
         print(
@@ -262,15 +274,22 @@ for epoch in range(1, EPOCHS + 1):
             f"blank ratio={blank_frames / total_frames:.3f}",
             flush=True,
         )
+
         evaluate_dev(epoch)
+
         for ref, hyp in zip(debug_refs[:2], debug_hyps[:2]):
             print("REF:", ref, flush=True)
             print("HYP:", repr(hyp), flush=True)
 
-        model.train()
+    print(f"Epoch {epoch}: loss={total_loss / len(train_loader):.4f}", flush=True)
+    if epoch % args.save_every == 0 or epoch == EPOCHS:
+        save_checkpoint(
+            args.checkpoint_dir / "latest.pt", model, optimizer, scheduler,
+            epoch, global_step, checkpoint_metadata,
+        )
 
 
-model_dir = PROJECT / "outputs/baseline_final"
+model_dir = args.output_dir
 model_dir.mkdir(parents=True, exist_ok=True)
 
 model.save_pretrained(model_dir, safe_serialization=True)

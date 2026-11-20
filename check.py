@@ -19,6 +19,11 @@ def main():
                         default=project / 'data/project')
     parser.add_argument('--output', type=Path,
                         default=project / 'dev_predictions_baseline.csv')
+    parser.add_argument(
+                        '--test-output',
+                        type=Path,
+                        default=project / 'test_predictions_baseline.csv',
+                    )
     args = parser.parse_args()
 
     if not torch.cuda.is_available():
@@ -97,6 +102,96 @@ def main():
         print('\nREF:', reference, flush=True)
         print('HYP:', repr(prediction), flush=True)
 
+        # ===== Predict test: no reference transcripts, so no WER/CER =====
+    test_csv = args.data_root / 'geo/test.csv'
+
+    with test_csv.open(encoding='utf-8-sig', newline='') as f:
+        reader = csv.DictReader(f)
+        if 'file' not in (reader.fieldnames or []):
+            raise ValueError('test.csv must contain a file column.')
+        test_rows = list(reader)
+
+    if not test_rows:
+        raise ValueError('test.csv is empty.')
+
+    # Prevent accidentally overwriting the source CSV or dev predictions.
+    if args.test_output.resolve() in {
+        test_csv.resolve(),
+        args.output.resolve(),
+    }:
+        raise ValueError('Test output must differ from input and dev output.')
+
+    test_predictions = []
+    model.eval()
+
+    with torch.inference_mode():
+        for index, row in enumerate(test_rows, start=1):
+            audio_path = args.data_root / row['file']
+            audio, sr = sf.read(audio_path, dtype='float32')
+
+            if sr != 16000 or audio.ndim != 1 or len(audio) == 0:
+                raise ValueError(
+                    f'Expected nonempty 16 kHz mono audio: {audio_path}'
+                )
+
+            inputs = processor(
+                audio,
+                sampling_rate=sr,
+                return_tensors='pt',
+                return_attention_mask=False,
+            ).input_values.cuda()
+
+            logits = model(input_values=inputs).logits
+
+            if not torch.isfinite(logits).all().item():
+                raise RuntimeError(
+                    f'Non-finite logits: {row["file"]}'
+                )
+
+            ids = logits.argmax(dim=-1)[0].cpu().tolist()
+
+            prediction = processor.tokenizer.decode(
+                ids,
+                group_tokens=True,
+                clean_up_tokenization_spaces=False,
+            )
+            test_predictions.append(prediction)
+
+            if index == 1 or index % 100 == 0 or index == len(test_rows):
+                print(
+                    f'Test predicted {index}/{len(test_rows)}',
+                    flush=True,
+                )
+
+    args.test_output.parent.mkdir(parents=True, exist_ok=True)
+
+    with args.test_output.open(
+        'w', encoding='utf-8', newline=''
+    ) as f:
+        writer = csv.writer(f)
+        writer.writerow(['file', 'prediction'])
+        writer.writerows(
+            (row['file'], prediction)
+            for row, prediction in zip(test_rows, test_predictions)
+        )
+
+    print('\n===== Test predictions =====', flush=True)
+
+    empty = sum(not text.strip() for text in test_predictions)
+    print(
+        f'Empty predictions: {empty}/{len(test_predictions)}',
+        flush=True,
+    )
+
+    for row, prediction in zip(test_rows[:5], test_predictions[:5]):
+        print('\nFILE:', row['file'], flush=True)
+        print('HYP:', repr(prediction), flush=True)
+
+    print(
+        '\nTest predictions saved to:',
+        args.test_output,
+        flush=True,
+    )
 
 if __name__ == '__main__':
     main()
